@@ -1,12 +1,7 @@
 import streamlit as st
-import base64
-import uuid
-import time
-import hashlib
-import shutil
+import base64, uuid, time, json, hashlib
 from cryptography.fernet import Fernet
 from datetime import datetime, timedelta
-from pathlib import Path
 import qrcode
 from io import BytesIO
 
@@ -14,25 +9,24 @@ from io import BytesIO
 # CONFIG
 # ===============================
 TTL_SECONDS = 120
-BASE_DIR = Path("/tmp/ttu_sync")
-BASE_DIR.mkdir(exist_ok=True)
+APP_URL = "https://ttu-sync-2030.streamlit.app"
 
-st.set_page_config(
-    page_title="TTU-Sync P2P",
-    layout="wide"
-)
+st.set_page_config("TTU-Sync", layout="wide")
+
+# ===============================
+# SHARED MEMORY (CLOUD SAFE)
+# ===============================
+@st.cache_resource
+def shared_sessions():
+    return {}
+
+SESSIONS = shared_sessions()
 
 # ===============================
 # UTILS
 # ===============================
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-def encrypt(data: bytes, key: bytes) -> bytes:
-    return Fernet(key).encrypt(data)
-
-def decrypt(data: bytes, key: bytes) -> bytes:
-    return Fernet(key).decrypt(data)
 
 def now():
     return datetime.utcnow()
@@ -50,46 +44,31 @@ tabs = st.tabs(["📤 Émetteur", "📥 Récepteur"])
 with tabs[0]:
     st.subheader("📤 Envoi sécurisé")
 
-    files = st.file_uploader(
-        "Sélectionner fichiers",
-        accept_multiple_files=True
-    )
+    files = st.file_uploader("Sélectionner fichiers", accept_multiple_files=True)
 
     if files and st.button("🚀 Démarrer session"):
         token = str(uuid.uuid4())
-        session_dir = BASE_DIR / token
-        session_dir.mkdir()
-
         key = Fernet.generate_key()
-        expires_at = now() + timedelta(seconds=TTL_SECONDS)
+        expires = now() + timedelta(seconds=TTL_SECONDS)
 
-        meta = {
-            "key": base64.b64encode(key).decode(),
-            "expires": expires_at.timestamp(),
-            "files": []
-        }
-
+        payload = []
         for f in files:
             raw = f.getvalue()
-            encrypted = encrypt(raw, key)
-
-            file_id = f"{uuid.uuid4()}.bin"
-            (session_dir / file_id).write_bytes(encrypted)
-
-            meta["files"].append({
+            encrypted = Fernet(key).encrypt(raw)
+            payload.append({
                 "name": f.name,
+                "data": base64.b64encode(encrypted).decode(),
                 "size": len(raw),
-                "sha256": sha256(raw),
-                "file_id": file_id
+                "sha256": sha256(raw)
             })
 
-        (session_dir / "meta.json").write_text(
-            base64.b64encode(
-                str(meta).encode()
-            ).decode()
-        )
+        SESSIONS[token] = {
+            "key": base64.b64encode(key).decode(),
+            "files": payload,
+            "expires": expires.timestamp()
+        }
 
-        link = f"?token={token}"
+        link = f"{APP_URL}/?token={token}"
 
         st.success("🔐 Session active")
         st.code(link)
@@ -97,9 +76,7 @@ with tabs[0]:
         qr = qrcode.make(link)
         buf = BytesIO()
         qr.save(buf)
-        st.image(buf.getvalue(), caption="📱 Scanner")
-
-        st.warning("⚠️ Garde cette page ouverte jusqu’à la réception")
+        st.image(buf.getvalue(), caption="📱 Scanner sur mobile")
 
 # =====================================================
 # 📥 RÉCEPTEUR
@@ -110,62 +87,37 @@ with tabs[1]:
     token = st.query_params.get("token")
 
     if not token:
-        st.info("📎 Ouvre un lien TTU-Sync ou scanne un QR code")
+        st.info("📎 Ouvre un lien ou scanne un QR code")
+    elif token not in SESSIONS:
+        st.error("❌ Session introuvable ou expirée")
     else:
-        session_dir = BASE_DIR / token
+        session = SESSIONS[token]
+        remaining = int(session["expires"] - now().timestamp())
 
-        if not session_dir.exists():
-            st.error("❌ Session introuvable ou expirée")
+        if remaining <= 0:
+            del SESSIONS[token]
+            st.error("⏳ Session expirée")
         else:
-            meta_path = session_dir / "meta.json"
-            meta = eval(
-                base64.b64decode(
-                    meta_path.read_text()
-                ).decode()
-            )
+            st.success("🔓 Session valide")
+            st.progress(remaining / TTL_SECONDS)
+            st.caption(f"⏳ Temps restant : {remaining} s")
 
-            expires = datetime.utcfromtimestamp(meta["expires"])
-            remaining = int((expires - now()).total_seconds())
+            key = base64.b64decode(session["key"])
 
-            if remaining <= 0:
-                shutil.rmtree(session_dir, ignore_errors=True)
-                st.error("⏳ Session expirée")
-            else:
-                st.success("🔓 Session valide")
+            for f in session["files"]:
+                decrypted = Fernet(key).decrypt(
+                    base64.b64decode(f["data"])
+                )
 
-                st.progress(remaining / TTL_SECONDS)
-                st.caption(f"⏳ Temps restant : {remaining} s")
+                st.download_button(
+                    f"⬇️ {f['name']}",
+                    data=decrypted,
+                    file_name=f["name"]
+                )
 
-                key = base64.b64decode(meta["key"])
+                st.caption(
+                    f"📦 {f['size']} octets | SHA-256 : `{f['sha256']}`"
+                )
 
-                for f in meta["files"]:
-                    encrypted = (session_dir / f["file_id"]).read_bytes()
-                    decrypted = decrypt(encrypted, key)
-
-                    st.download_button(
-                        f"⬇️ {f['name']}",
-                        data=decrypted,
-                        file_name=f["name"]
-                    )
-
-                    st.caption(
-                        f"📦 {f['size']} octets | SHA-256 : `{f['sha256']}`"
-                    )
-
-                time.sleep(1)
-                st.rerun()
-
-# ===============================
-# CLEANUP GLOBAL
-# ===============================
-for d in BASE_DIR.iterdir():
-    try:
-        meta = eval(
-            base64.b64decode(
-                (d / "meta.json").read_text()
-            ).decode()
-        )
-        if datetime.utcfromtimestamp(meta["expires"]) < now():
-            shutil.rmtree(d, ignore_errors=True)
-    except Exception:
-        pass
+            time.sleep(1)
+            st.rerun()
