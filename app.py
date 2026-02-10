@@ -2,6 +2,7 @@ import streamlit as st
 import time
 import base64
 import plotly.graph_objects as go
+from datetime import datetime
 
 # ===============================
 # MOTEUR TTU-SYNC (CORE)
@@ -13,6 +14,7 @@ class TTUSync:
         self.threshold = threshold
         self.k_curvature = k_curvature
         self.history = []
+        self.transfers = []
 
     def connect(self, noise_level):
         phi_a = 0.85
@@ -40,15 +42,20 @@ class TTUSync:
 # ISOTOPISATION TTU
 # ===============================
 def isotopize_file(uploaded_file, phi_c):
-    data = uploaded_file.getvalue()
-    encoded = base64.b64encode(data).decode("utf-8")
+    raw = uploaded_file.getvalue()
+    encoded = base64.b64encode(raw).decode("utf-8")
 
     return {
         "name": uploaded_file.name,
-        "size": len(data),
+        "size": len(raw),
         "phi_c": round(phi_c, 4),
+        "timestamp": datetime.utcnow().isoformat(),
         "payload": encoded
     }
+
+
+def reconstruct_file(isotope):
+    return base64.b64decode(isotope["payload"])
 
 
 # ===============================
@@ -59,112 +66,129 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📶 TTU-Sync : Résonance de Proximité")
+st.title("📶 TTU-Sync — Partage de fichiers par résonance")
 
 # ===============================
-# SESSION TTU
+# SESSION
 # ===============================
 if "engine" not in st.session_state:
-    st.session_state.engine = TTUSync("Smartphone-Alpha")
+    st.session_state.engine = TTUSync("Device-TTU")
 
 engine = st.session_state.engine
 
 # ===============================
-# SIDEBAR – PARAMÈTRES
+# SIDEBAR
 # ===============================
-st.sidebar.header("⚙️ Scanner d’Espace de Phase")
+st.sidebar.header("⚙️ Paramètres de liaison")
 
-noise = st.sidebar.slider(
-    "Bruit (Interférence rose)",
-    min_value=0.0,
-    max_value=2.0,
-    value=0.5
-)
-
-expert = st.sidebar.toggle("🧠 Mode Expert TTU")
+noise = st.sidebar.slider("Bruit d’environnement", 0.0, 2.0, 0.5)
+expert = st.sidebar.toggle("🧠 Mode Expert")
 
 if expert:
-    engine.phi_m = st.sidebar.slider("Mémoire Φm", 0.85, 1.0, engine.phi_m)
+    engine.phi_m = st.sidebar.slider("Φm (mémoire)", 0.85, 1.0, engine.phi_m)
     engine.threshold = st.sidebar.slider("Seuil Φc", 0.3, 0.8, engine.threshold)
     engine.k_curvature = st.sidebar.slider("Courbure K", 5.0, 50.0, engine.k_curvature)
 
 # ===============================
-# LAYOUT PRINCIPAL
+# LAYOUT
 # ===============================
 col1, col2 = st.columns([1, 2])
 
-# ---------- ÉTAT DU NOEUD ----------
+# ---------- COLONNE GAUCHE ----------
 with col1:
-    st.subheader("🔗 État du Nœud")
+    st.subheader("🔗 État de connexion")
 
-    if st.button("Lancer l’Appairage Isotopique"):
-        with st.spinner("Alignement des phases…"):
-            time.sleep(1.2)
+    if st.button("Lancer l’appairage"):
+        with st.spinner("Synchronisation TTU…"):
+            time.sleep(1.1)
 
         phi, status, k = engine.connect(noise)
 
         if status == "LINK_STABLE":
-            st.success(f"Connexion Pure | Φc = {phi:.4f}")
-            st.info(f"Courbure K = {k:.2f}")
+            st.success(f"Connexion stable | Φc = {phi:.4f}")
         elif status == "LINK_RESONANT":
-            st.warning(f"Connexion Stabilisée | Φc = {phi:.4f}")
-            st.write(f"🧬 Courbure adaptative K = {k:.2f}")
+            st.warning(f"Connexion compensée | Φc = {phi:.4f}")
         else:
-            st.error("Dissolution : bruit non compensable")
+            st.error("Connexion dissoute")
 
     st.divider()
 
-    uploaded = st.file_uploader("📦 Transfert Isotopique (TTU-Payload)")
+    uploaded = st.file_uploader("📤 Envoyer un fichier")
 
-    if uploaded is not None and engine.history:
+    if uploaded and engine.history:
         isotope = isotopize_file(uploaded, engine.history[-1])
-        st.success("Fichier isotopisé avec succès")
-        st.json(isotope, expanded=False)
+        engine.transfers.append(isotope)
 
-# ---------- VISUALISATION ----------
-with col2:
-    st.subheader("📈 Gradient de Cohérence")
+        st.success("Fichier encapsulé (TTU-Payload)")
 
-    current_phi = (engine.phi_m * 0.85) / (1 + (noise * 0.45))
+        # Reconstruction automatique
+        reconstructed = reconstruct_file(isotope)
 
-    fig = go.Figure(
-        go.Indicator(
-            mode="gauge+number",
-            value=current_phi,
-            title={"text": "Φc – Cohérence Liaison"},
-            gauge={
-                "axis": {"range": [0, 1]},
-                "steps": [
-                    {"range": [0, engine.threshold], "color": "crimson"},
-                    {"range": [engine.threshold, 1], "color": "limegreen"}
-                ],
-                "threshold": {
-                    "line": {"color": "white", "width": 4},
-                    "value": engine.threshold
-                }
-            }
+        st.download_button(
+            label="⬇️ Télécharger le fichier décodé",
+            data=reconstructed,
+            file_name=isotope["name"],
+            mime="application/octet-stream"
         )
-    )
+
+        st.json(
+            {k: isotope[k] for k in isotope if k != "payload"},
+            expanded=False
+        )
+
+# ---------- COLONNE DROITE ----------
+with col2:
+    st.subheader("📈 Cohérence de liaison")
+
+    current_phi = (engine.phi_m * 0.85) / (1 + noise * 0.45)
+
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=current_phi,
+        title={"text": "Φc — Qualité du lien"},
+        gauge={
+            "axis": {"range": [0, 1]},
+            "steps": [
+                {"range": [0, engine.threshold], "color": "crimson"},
+                {"range": [engine.threshold, 1], "color": "limegreen"}
+            ],
+            "threshold": {
+                "line": {"color": "white", "width": 4},
+                "value": engine.threshold
+            }
+        }
+    ))
 
     st.plotly_chart(fig, use_container_width=True)
 
     if engine.history:
-        st.subheader("🧠 Mémoire TTU (Historique Φc)")
+        st.subheader("🧠 Historique Φc")
         st.line_chart(engine.history)
 
+    if engine.transfers:
+        st.subheader("📚 Historique des transferts")
+        st.table([
+            {
+                "Nom": t["name"],
+                "Taille (octets)": t["size"],
+                "Φc": t["phi_c"],
+                "Date": t["timestamp"]
+            }
+            for t in engine.transfers
+        ])
+
 # ===============================
-# EXPLICATION
+# FOOTER
 # ===============================
 st.divider()
-
 st.markdown("""
-### 🛠 Pourquoi TTU-Sync dépasse le Bluetooth
+### 🚀 TTU-Sync comme outil de partage
 
-• **Adaptation géométrique** : le lien se stabilise par courbure, pas par puissance  
-• **Sécurité par mémoire** : Φm agit comme une clé topologique  
-• **Transmission isotopique** : le fichier devient une signature de phase  
-• **Résilience au bruit** : compensation Erbium-166 intégrée  
+• Partage fichiers **PC ↔ téléphone** via navigateur  
+• Sans limite stricte (dépend du serveur Streamlit)  
+• Téléchargement immédiat, sans compte  
+• Φc = contrôle de qualité du transfert  
 
-👉 Ce n’est plus un protocole radio.  
-👉 C’est une **dynamique de résonance informationnelle**.
+👉 Alternative conceptuelle à WeTransfer / Smash  
+👉 Base idéale pour chiffrement, lien temporaire, QR code
 """)
