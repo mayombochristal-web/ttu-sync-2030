@@ -1,32 +1,25 @@
 import streamlit as st
 import base64
-import os
-import json
 import time
 import uuid
 import hashlib
-from datetime import datetime, timedelta
-
 from cryptography.fernet import Fernet
+from datetime import datetime, timedelta
 import qrcode
-from PIL import Image
-import plotly.graph_objects as go
 
 # ===============================
 # CONFIG
 # ===============================
-STORAGE_DIR = "ttu_storage"
-TTL_MINUTES = 10  # auto-destruction
+APP_BASE_URL = "https://ttu-sync-2030.streamlit.app"
+TTL_SECONDS = 120  # durée de vie P2P
 
-os.makedirs(STORAGE_DIR, exist_ok=True)
-
-st.set_page_config(page_title="TTU-Sync Secure Share", layout="wide")
+st.set_page_config(page_title="TTU-Sync P2P", layout="wide")
 
 # ===============================
 # CRYPTO
 # ===============================
-def generate_key():
-    return Fernet.generate_key()
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 def encrypt(data: bytes, key: bytes) -> bytes:
     return Fernet(key).encrypt(data)
@@ -34,142 +27,148 @@ def encrypt(data: bytes, key: bytes) -> bytes:
 def decrypt(data: bytes, key: bytes) -> bytes:
     return Fernet(key).decrypt(data)
 
-def sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
 # ===============================
-# STORAGE
+# SESSION P2P (RAM ONLY)
 # ===============================
-def save_payload(token, payload):
-    path = os.path.join(STORAGE_DIR, f"{token}.json")
-    with open(path, "w") as f:
-        json.dump(payload, f)
-
-def load_payload(token):
-    path = os.path.join(STORAGE_DIR, f"{token}.json")
-    if not os.path.exists(path):
-        return None
-    with open(path, "r") as f:
-        return json.load(f)
-
-def delete_payload(token):
-    path = os.path.join(STORAGE_DIR, f"{token}.json")
-    if os.path.exists(path):
-        os.remove(path)
-
-def expired(payload):
-    return datetime.utcnow() > datetime.fromisoformat(payload["expires_at"])
+if "p2p_sessions" not in st.session_state:
+    st.session_state.p2p_sessions = {}
 
 # ===============================
 # UI
 # ===============================
-st.title("🔐 TTU-Sync — Secure File Transfer")
+st.title("🔗 TTU-Sync — Mode P2P Résonant")
 
-tabs = st.tabs(["📤 Envoyer", "📥 Recevoir"])
+tabs = st.tabs(["📤 Émetteur", "📥 Récepteur"])
 
-# =========================================================
-# 📤 ENVOI
-# =========================================================
+# =====================================================
+# 📤 ÉMETTEUR
+# =====================================================
 with tabs[0]:
-    st.subheader("📤 Partager des fichiers")
+    st.subheader("📤 Partage P2P (sans stockage serveur)")
 
-    uploaded_files = st.file_uploader(
-        "Sélectionner un ou plusieurs fichiers",
+    files = st.file_uploader(
+        "Sélectionner des fichiers",
         accept_multiple_files=True
     )
 
-    if uploaded_files:
-        if st.button("🚀 Générer lien sécurisé TTU"):
-            key = generate_key()
+    if files:
+        if st.button("🚀 Démarrer session P2P"):
             token = str(uuid.uuid4())
+            key = Fernet.generate_key()
+            expires_at = datetime.utcnow() + timedelta(seconds=TTL_SECONDS)
 
-            files_meta = []
+            payload = []
 
-            for file in uploaded_files:
-                raw = file.getvalue()
+            for f in files:
+                raw = f.getvalue()
                 encrypted = encrypt(raw, key)
-
-                files_meta.append({
-                    "name": file.name,
+                payload.append({
+                    "name": f.name,
                     "size": len(raw),
                     "sha256": sha256(raw),
-                    "payload": base64.b64encode(encrypted).decode()
+                    "data": base64.b64encode(encrypted).decode()
                 })
 
-            payload = {
-                "token": token,
+            st.session_state.p2p_sessions[token] = {
                 "key": base64.b64encode(key).decode(),
-                "created_at": datetime.utcnow().isoformat(),
-                "expires_at": (datetime.utcnow() + timedelta(minutes=TTL_MINUTES)).isoformat(),
-                "files": files_meta
+                "files": payload,
+                "expires_at": expires_at
             }
 
-            save_payload(token, payload)
-
-            # → **ICI tu mets l'URL publique de ton app**
-            APP_BASE_URL = "https://ttu-sync-2030.streamlit.app"
             link = f"{APP_BASE_URL}/?token={token}"
 
-            st.success("Lien généré avec succès")
+            st.success("🔐 Session P2P active")
             st.code(link)
 
             qr = qrcode.make(link)
             st.image(qr, caption="📱 Scanner sur mobile")
 
-            st.info(f"⏳ Auto-destruction dans {TTL_MINUTES} minutes")
+            st.warning("⚠️ Garde cette page ouverte")
 
-# =========================================================
-# 📥 RÉCEPTION
-# =========================================================
+    # ⏳ Compte à rebours émetteur
+    query = st.query_params
+    token = query.get("token")
+
+    if token and token in st.session_state.p2p_sessions:
+        remaining = int(
+            (st.session_state.p2p_sessions[token]["expires_at"] - datetime.utcnow()).total_seconds()
+        )
+
+        if remaining > 0:
+            st.progress(remaining / TTL_SECONDS)
+            st.caption(f"⏳ Temps restant : {remaining} s")
+            time.sleep(1)
+            st.rerun()
+        else:
+            del st.session_state.p2p_sessions[token]
+            st.error("💥 Session P2P expirée")
+
+# =====================================================
+# 📥 RÉCEPTEUR
+# =====================================================
 with tabs[1]:
-    st.subheader("📥 Récupérer des fichiers")
+    st.subheader("📥 Réception P2P")
 
-    query = st.experimental_get_query_params()
-    token = query.get("token", [None])[0]
+    query = st.query_params
+    token = query.get("token")
 
     if token:
-        payload = load_payload(token)
+        session = st.session_state.p2p_sessions.get(token)
 
-        if payload is None:
-            st.error("❌ Lien invalide ou déjà détruit")
-        elif expired(payload):
-            delete_payload(token)
-            st.error("⏳ Lien expiré (auto-détruit)")
+        if session is None:
+            st.error("❌ Session inexistante ou émetteur déconnecté")
         else:
-            st.success("🔓 Lien valide")
+            remaining = int(
+                (session["expires_at"] - datetime.utcnow()).total_seconds()
+            )
 
-            key = base64.b64decode(payload["key"])
+            if remaining <= 0:
+                del st.session_state.p2p_sessions[token]
+                st.error("⏳ Session expirée")
+            else:
+                st.success("🔓 Session P2P active")
 
-            for file in payload["files"]:
-                encrypted = base64.b64decode(file["payload"])
-                decrypted = decrypt(encrypted, key)
+                st.progress(remaining / TTL_SECONDS)
+                st.caption(f"⏳ Temps restant : {remaining} s")
 
-                st.download_button(
-                    label=f"⬇️ Télécharger {file['name']}",
-                    data=decrypted,
-                    file_name=file["name"]
-                )
+                key = base64.b64decode(session["key"])
 
-                st.caption(
-                    f"📦 {file['size']} octets | 🧾 SHA-256 : `{file['sha256']}`"
-                )
+                for f in session["files"]:
+                    decrypted = decrypt(
+                        base64.b64decode(f["data"]),
+                        key
+                    )
 
-            if st.button("🗑 Détruire le lien maintenant"):
-                delete_payload(token)
-                st.warning("Lien détruit manuellement")
+                    st.download_button(
+                        label=f"⬇️ Télécharger {f['name']}",
+                        data=decrypted,
+                        file_name=f["name"]
+                    )
 
+                    st.caption(
+                        f"📦 {f['size']} octets | 🧾 SHA-256 : `{f['sha256']}`"
+                    )
+
+                time.sleep(1)
+                st.rerun()
     else:
-        st.info("📎 Ouvre un lien TTU pour récupérer les fichiers")
+        st.info("📎 Ouvre un lien TTU P2P")
 
+# ===============================
 # FOOTER
+# ===============================
 st.divider()
 st.markdown("""
-### 🧠 TTU-Sync version “outil de partage”
-✔ Partage PC ↔ téléphone  
-✔ Aucun compte  
-✔ AES sécurisé  
-✔ Auto-destruction ⏳  
-✔ QR + lien  
+### 🧠 Mode P2P TTU — Ce que tu as maintenant
+
+✔ Aucun fichier stocké sur le serveur  
+✔ Chiffrement AES en mémoire  
+✔ QR code mobile  
 ✔ Multi-fichiers  
-✔ Preuve d’intégrité SHA-256
+✔ SHA-256 (preuve d’intégrité)  
+✔ Compte à rebours visuel ⏳  
+✔ Auto-destruction réelle  
+
+👉 **Émetteur fermé = données détruites**
+👉 **Résonance vivante, pas d’archive**
 """)
