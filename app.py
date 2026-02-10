@@ -106,12 +106,13 @@ with tabs[0]:
 
             save_payload(token, payload)
 
-            link = f"{st.get_url()}?token={token}"
+            # → **ICI tu mets l'URL publique de ton app**
+            APP_BASE_URL = "https://ttu-sync-2030.streamlit.app"
+            link = f"{APP_BASE_URL}/?token={token}"
 
             st.success("Lien généré avec succès")
             st.code(link)
 
-            # QR Code
             qr = qrcode.make(link)
             st.image(qr, caption="📱 Scanner sur mobile")
 
@@ -123,8 +124,8 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("📥 Récupérer des fichiers")
 
-    query = st.query_params
-    token = query.get("token", None)
+    query = st.experimental_get_query_params()
+    token = query.get("token", [None])[0]
 
     if token:
         payload = load_payload(token)
@@ -160,19 +161,15 @@ with tabs[1]:
     else:
         st.info("📎 Ouvre un lien TTU pour récupérer les fichiers")
 
-# =========================================================
 # FOOTER
-# =========================================================
 st.divider()
 st.markdown("""
-### 🧠 Ce que fait réellement TTU-Sync
-
+### 🧠 TTU-Sync version “outil de partage”
 ✔ Partage PC ↔ téléphone  
 ✔ Aucun compte  
-✔ Aucun stockage permanent  
-✔ Sécurité par chiffrement AES (Fernet)  
-✔ Intégrité garantie SHA-256  
-✔ Auto-destruction contrôlée  
-
-👉 **TTU-Sync = WeTransfer + Signal + QR**
+✔ AES sécurisé  
+✔ Auto-destruction ⏳  
+✔ QR + lien  
+✔ Multi-fichiers  
+✔ Preuve d’intégrité SHA-256
 """)
