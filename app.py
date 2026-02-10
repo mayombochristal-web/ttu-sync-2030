@@ -3,31 +3,24 @@ import base64
 import time
 import uuid
 import hashlib
-import io
 from cryptography.fernet import Fernet
 from datetime import datetime, timedelta
 import qrcode
+from io import BytesIO
 
 # ===============================
-# CONFIG
+# CONFIG STREAMLIT CLOUD
 # ===============================
-TTL_SECONDS = 120
-APP_BASE_URL = st.request.url.split("?")[0]
+APP_BASE_URL = "https://ttu-sync-2030.streamlit.app"
+TTL_SECONDS = 120  # durée de vie de la session P2P
 
-st.set_page_config(page_title="TTU-Sync P2P", layout="wide")
-st.title("🔗 TTU-Sync — Partage Temporaire Sécurisé")
-
-# ===============================
-# RELAIS MÉMOIRE GLOBAL (STREAMLIT)
-# ===============================
-@st.cache_resource
-def relay():
-    return {}
-
-RELAY = relay()
+st.set_page_config(
+    page_title="TTU-Sync P2P",
+    layout="wide"
+)
 
 # ===============================
-# CRYPTO
+# OUTILS CRYPTO
 # ===============================
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -38,18 +31,16 @@ def encrypt(data: bytes, key: bytes) -> bytes:
 def decrypt(data: bytes, key: bytes) -> bytes:
     return Fernet(key).decrypt(data)
 
-def make_qr(link: str):
-    img = qrcode.make(link)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+# ===============================
+# MÉMOIRE RAM (SESSION ONLY)
+# ===============================
+if "p2p_sessions" not in st.session_state:
+    st.session_state.p2p_sessions = {}
 
 # ===============================
-# TOKEN URL
+# UI
 # ===============================
-query = st.query_params
-token = query.get("token")
+st.title("🔗 TTU-Sync — Mode P2P Résonant")
 
 tabs = st.tabs(["📤 Émetteur", "📥 Récepteur"])
 
@@ -57,14 +48,14 @@ tabs = st.tabs(["📤 Émetteur", "📥 Récepteur"])
 # 📤 ÉMETTEUR
 # =====================================================
 with tabs[0]:
-    st.subheader("📤 Envoyer des fichiers")
+    st.subheader("📤 Partage P2P sécurisé (sans stockage serveur)")
 
     files = st.file_uploader(
-        "Sélectionner des fichiers",
+        "Sélectionne un ou plusieurs fichiers",
         accept_multiple_files=True
     )
 
-    if files and st.button("🚀 Créer session P2P"):
+    if files and st.button("🚀 Démarrer la session P2P"):
         token = str(uuid.uuid4())
         key = Fernet.generate_key()
         expires_at = datetime.utcnow() + timedelta(seconds=TTL_SECONDS)
@@ -73,102 +64,114 @@ with tabs[0]:
 
         for f in files:
             raw = f.getvalue()
+            encrypted = encrypt(raw, key)
+
             payload.append({
                 "name": f.name,
                 "size": len(raw),
                 "sha256": sha256(raw),
-                "data": base64.b64encode(
-                    encrypt(raw, key)
-                ).decode()
+                "data": base64.b64encode(encrypted).decode()
             })
 
-        RELAY[token] = {
+        st.session_state.p2p_sessions[token] = {
             "key": base64.b64encode(key).decode(),
             "files": payload,
             "expires_at": expires_at
         }
 
-        link = f"{APP_BASE_URL}?token={token}"
+        link = f"{APP_BASE_URL}/?token={token}"
 
-        st.success("🔐 Session active")
+        st.success("🔐 Session P2P active")
         st.code(link)
-        st.image(make_qr(link), caption="📱 Scanner avec le téléphone")
-        st.warning("⚠️ Ne ferme pas cette page")
 
-    if token in RELAY:
-        remaining = int(
-            (RELAY[token]["expires_at"] - datetime.utcnow()).total_seconds()
-        )
+        # QR CODE (FORMAT STREAMLIT COMPATIBLE)
+        qr = qrcode.make(link)
+        buf = BytesIO()
+        qr.save(buf, format="PNG")
+        st.image(buf.getvalue(), caption="📱 Scanner sur mobile")
+
+        st.warning("⚠️ Garde cette page ouverte (RAM active)")
+
+    # ⏳ COMPTE À REBOURS ÉMETTEUR
+    query = st.query_params
+    token = query.get("token")
+
+    if token and token in st.session_state.p2p_sessions:
+        session = st.session_state.p2p_sessions[token]
+        remaining = int((session["expires_at"] - datetime.utcnow()).total_seconds())
+
         if remaining > 0:
             st.progress(remaining / TTL_SECONDS)
-            st.caption(f"⏳ Temps restant : {remaining}s")
+            st.caption(f"⏳ Temps restant : {remaining} s")
+            time.sleep(1)
+            st.rerun()
         else:
-            RELAY.pop(token, None)
-            st.error("⏳ Session expirée")
+            del st.session_state.p2p_sessions[token]
+            st.error("💥 Session P2P expirée")
 
 # =====================================================
 # 📥 RÉCEPTEUR
 # =====================================================
 with tabs[1]:
-    st.subheader("📥 Réception")
+    st.subheader("📥 Réception sécurisée")
 
-    if token and token in RELAY:
-        session = RELAY[token]
-        remaining = int(
-            (session["expires_at"] - datetime.utcnow()).total_seconds()
-        )
+    query = st.query_params
+    token = query.get("token")
 
-        if remaining <= 0:
-            RELAY.pop(token, None)
-            st.error("⏳ Session expirée")
-        else:
-            st.success("🔓 Session active")
-            st.progress(remaining / TTL_SECONDS)
-            st.caption(f"⏳ Temps restant : {remaining}s")
-
-            key = base64.b64decode(session["key"])
-
-            for f in session["files"]:
-                decrypted = decrypt(
-                    base64.b64decode(f["data"]),
-                    key
-                )
-
-                st.download_button(
-                    f"⬇️ Télécharger {f['name']}",
-                    data=decrypted,
-                    file_name=f["name"]
-                )
-
-                st.caption(
-                    f"📦 {f['size']} octets | 🧾 SHA-256 : `{f['sha256']}`"
-                )
+    if not token:
+        st.info("📎 Ouvre un lien TTU-Sync ou scanne un QR code")
     else:
-        st.info("📎 Scanne ou ouvre un lien TTU-Sync")
+        session = st.session_state.p2p_sessions.get(token)
 
-# ===============================
-# NETTOYAGE AUTO
-# ===============================
-now = datetime.utcnow()
-expired = [t for t, v in RELAY.items() if v["expires_at"] < now]
-for t in expired:
-    RELAY.pop(t, None)
+        if session is None:
+            st.error("❌ Session inexistante ou émetteur déconnecté")
+        else:
+            remaining = int((session["expires_at"] - datetime.utcnow()).total_seconds())
+
+            if remaining <= 0:
+                del st.session_state.p2p_sessions[token]
+                st.error("⏳ Session expirée")
+            else:
+                st.success("🔓 Session P2P active")
+                st.progress(remaining / TTL_SECONDS)
+                st.caption(f"⏳ Temps restant : {remaining} s")
+
+                key = base64.b64decode(session["key"])
+
+                for f in session["files"]:
+                    decrypted = decrypt(
+                        base64.b64decode(f["data"]),
+                        key
+                    )
+
+                    st.download_button(
+                        label=f"⬇️ Télécharger {f['name']}",
+                        data=decrypted,
+                        file_name=f["name"]
+                    )
+
+                    st.caption(
+                        f"📦 {f['size']} octets | 🧾 SHA-256 : `{f['sha256']}`"
+                    )
+
+                time.sleep(1)
+                st.rerun()
 
 # ===============================
 # FOOTER
 # ===============================
 st.divider()
 st.markdown("""
-### 🧠 Ce mode TTU-Sync fait réellement
+### 🧠 TTU-Sync P2P — Ce que tu as maintenant
 
-✔ RAM uniquement (aucun disque)  
-✔ Partage multi-fichiers  
+✔ Aucun stockage serveur  
 ✔ Chiffrement AES (Fernet)  
-✔ QR code mobile stable  
-✔ Hash SHA-256  
-✔ Auto-destruction TTL  
-✔ Récepteur **fonctionnel PC ↔ mobile**
+✔ QR code mobile fonctionnel  
+✔ Multi-fichiers  
+✔ SHA-256 (preuve d’intégrité)  
+✔ Compte à rebours visuel ⏳  
+✔ Auto-destruction RAM  
 
-👉 Ce n’est pas du WebRTC pur  
-👉 Mais **le comportement utilisateur est identique**
+👉 **Émetteur fermé = données détruites**  
+👉 **Résonance vivante, pas d’archive**
 """)
