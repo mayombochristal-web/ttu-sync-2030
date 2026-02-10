@@ -1,194 +1,178 @@
 import streamlit as st
-import time
 import base64
+import os
+import json
+import time
+import uuid
+import hashlib
+from datetime import datetime, timedelta
+
+from cryptography.fernet import Fernet
+import qrcode
+from PIL import Image
 import plotly.graph_objects as go
-from datetime import datetime
 
 # ===============================
-# MOTEUR TTU-SYNC (CORE)
+# CONFIG
 # ===============================
-class TTUSync:
-    def __init__(self, device_name, phi_m=0.988, threshold=0.5088, k_curvature=24.92):
-        self.device_name = device_name
-        self.phi_m = phi_m
-        self.threshold = threshold
-        self.k_curvature = k_curvature
-        self.history = []
-        self.transfers = []
+STORAGE_DIR = "ttu_storage"
+TTL_MINUTES = 10  # auto-destruction
 
-    def connect(self, noise_level):
-        phi_a = 0.85
-        phi_d = noise_level * 0.45
+os.makedirs(STORAGE_DIR, exist_ok=True)
 
-        phi_c = (self.phi_m * phi_a) / (1 + phi_d)
-        status = "LINK_STABLE"
-        k = self.k_curvature
-
-        if phi_c < self.threshold:
-            status = "LINK_RESONANT"
-            k = self.k_curvature * (1 + (self.threshold - phi_c))
-            phi_a *= 1.35
-            phi_c = (self.phi_m * phi_a) / (1 + phi_d)
-
-            if phi_c < self.threshold:
-                status = "LINK_DISSOLVED"
-                k = 0.0
-
-        self.history.append(phi_c)
-        return phi_c, status, k
-
+st.set_page_config(page_title="TTU-Sync Secure Share", layout="wide")
 
 # ===============================
-# ISOTOPISATION TTU
+# CRYPTO
 # ===============================
-def isotopize_file(uploaded_file, phi_c):
-    raw = uploaded_file.getvalue()
-    encoded = base64.b64encode(raw).decode("utf-8")
+def generate_key():
+    return Fernet.generate_key()
 
-    return {
-        "name": uploaded_file.name,
-        "size": len(raw),
-        "phi_c": round(phi_c, 4),
-        "timestamp": datetime.utcnow().isoformat(),
-        "payload": encoded
-    }
+def encrypt(data: bytes, key: bytes) -> bytes:
+    return Fernet(key).encrypt(data)
 
+def decrypt(data: bytes, key: bytes) -> bytes:
+    return Fernet(key).decrypt(data)
 
-def reconstruct_file(isotope):
-    return base64.b64decode(isotope["payload"])
-
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 # ===============================
-# STREAMLIT UI
+# STORAGE
 # ===============================
-st.set_page_config(
-    page_title="TTU-Sync 2026",
-    layout="wide"
-)
+def save_payload(token, payload):
+    path = os.path.join(STORAGE_DIR, f"{token}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f)
 
-st.title("📶 TTU-Sync — Partage de fichiers par résonance")
+def load_payload(token):
+    path = os.path.join(STORAGE_DIR, f"{token}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        return json.load(f)
 
-# ===============================
-# SESSION
-# ===============================
-if "engine" not in st.session_state:
-    st.session_state.engine = TTUSync("Device-TTU")
+def delete_payload(token):
+    path = os.path.join(STORAGE_DIR, f"{token}.json")
+    if os.path.exists(path):
+        os.remove(path)
 
-engine = st.session_state.engine
-
-# ===============================
-# SIDEBAR
-# ===============================
-st.sidebar.header("⚙️ Paramètres de liaison")
-
-noise = st.sidebar.slider("Bruit d’environnement", 0.0, 2.0, 0.5)
-expert = st.sidebar.toggle("🧠 Mode Expert")
-
-if expert:
-    engine.phi_m = st.sidebar.slider("Φm (mémoire)", 0.85, 1.0, engine.phi_m)
-    engine.threshold = st.sidebar.slider("Seuil Φc", 0.3, 0.8, engine.threshold)
-    engine.k_curvature = st.sidebar.slider("Courbure K", 5.0, 50.0, engine.k_curvature)
+def expired(payload):
+    return datetime.utcnow() > datetime.fromisoformat(payload["expires_at"])
 
 # ===============================
-# LAYOUT
+# UI
 # ===============================
-col1, col2 = st.columns([1, 2])
+st.title("🔐 TTU-Sync — Secure File Transfer")
 
-# ---------- COLONNE GAUCHE ----------
-with col1:
-    st.subheader("🔗 État de connexion")
+tabs = st.tabs(["📤 Envoyer", "📥 Recevoir"])
 
-    if st.button("Lancer l’appairage"):
-        with st.spinner("Synchronisation TTU…"):
-            time.sleep(1.1)
+# =========================================================
+# 📤 ENVOI
+# =========================================================
+with tabs[0]:
+    st.subheader("📤 Partager des fichiers")
 
-        phi, status, k = engine.connect(noise)
+    uploaded_files = st.file_uploader(
+        "Sélectionner un ou plusieurs fichiers",
+        accept_multiple_files=True
+    )
 
-        if status == "LINK_STABLE":
-            st.success(f"Connexion stable | Φc = {phi:.4f}")
-        elif status == "LINK_RESONANT":
-            st.warning(f"Connexion compensée | Φc = {phi:.4f}")
+    if uploaded_files:
+        if st.button("🚀 Générer lien sécurisé TTU"):
+            key = generate_key()
+            token = str(uuid.uuid4())
+
+            files_meta = []
+
+            for file in uploaded_files:
+                raw = file.getvalue()
+                encrypted = encrypt(raw, key)
+
+                files_meta.append({
+                    "name": file.name,
+                    "size": len(raw),
+                    "sha256": sha256(raw),
+                    "payload": base64.b64encode(encrypted).decode()
+                })
+
+            payload = {
+                "token": token,
+                "key": base64.b64encode(key).decode(),
+                "created_at": datetime.utcnow().isoformat(),
+                "expires_at": (datetime.utcnow() + timedelta(minutes=TTL_MINUTES)).isoformat(),
+                "files": files_meta
+            }
+
+            save_payload(token, payload)
+
+            link = f"{st.get_url()}?token={token}"
+
+            st.success("Lien généré avec succès")
+            st.code(link)
+
+            # QR Code
+            qr = qrcode.make(link)
+            st.image(qr, caption="📱 Scanner sur mobile")
+
+            st.info(f"⏳ Auto-destruction dans {TTL_MINUTES} minutes")
+
+# =========================================================
+# 📥 RÉCEPTION
+# =========================================================
+with tabs[1]:
+    st.subheader("📥 Récupérer des fichiers")
+
+    query = st.query_params
+    token = query.get("token", None)
+
+    if token:
+        payload = load_payload(token)
+
+        if payload is None:
+            st.error("❌ Lien invalide ou déjà détruit")
+        elif expired(payload):
+            delete_payload(token)
+            st.error("⏳ Lien expiré (auto-détruit)")
         else:
-            st.error("Connexion dissoute")
+            st.success("🔓 Lien valide")
 
-    st.divider()
+            key = base64.b64decode(payload["key"])
 
-    uploaded = st.file_uploader("📤 Envoyer un fichier")
+            for file in payload["files"]:
+                encrypted = base64.b64decode(file["payload"])
+                decrypted = decrypt(encrypted, key)
 
-    if uploaded and engine.history:
-        isotope = isotopize_file(uploaded, engine.history[-1])
-        engine.transfers.append(isotope)
+                st.download_button(
+                    label=f"⬇️ Télécharger {file['name']}",
+                    data=decrypted,
+                    file_name=file["name"]
+                )
 
-        st.success("Fichier encapsulé (TTU-Payload)")
+                st.caption(
+                    f"📦 {file['size']} octets | 🧾 SHA-256 : `{file['sha256']}`"
+                )
 
-        # Reconstruction automatique
-        reconstructed = reconstruct_file(isotope)
+            if st.button("🗑 Détruire le lien maintenant"):
+                delete_payload(token)
+                st.warning("Lien détruit manuellement")
 
-        st.download_button(
-            label="⬇️ Télécharger le fichier décodé",
-            data=reconstructed,
-            file_name=isotope["name"],
-            mime="application/octet-stream"
-        )
+    else:
+        st.info("📎 Ouvre un lien TTU pour récupérer les fichiers")
 
-        st.json(
-            {k: isotope[k] for k in isotope if k != "payload"},
-            expanded=False
-        )
-
-# ---------- COLONNE DROITE ----------
-with col2:
-    st.subheader("📈 Cohérence de liaison")
-
-    current_phi = (engine.phi_m * 0.85) / (1 + noise * 0.45)
-
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=current_phi,
-        title={"text": "Φc — Qualité du lien"},
-        gauge={
-            "axis": {"range": [0, 1]},
-            "steps": [
-                {"range": [0, engine.threshold], "color": "crimson"},
-                {"range": [engine.threshold, 1], "color": "limegreen"}
-            ],
-            "threshold": {
-                "line": {"color": "white", "width": 4},
-                "value": engine.threshold
-            }
-        }
-    ))
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    if engine.history:
-        st.subheader("🧠 Historique Φc")
-        st.line_chart(engine.history)
-
-    if engine.transfers:
-        st.subheader("📚 Historique des transferts")
-        st.table([
-            {
-                "Nom": t["name"],
-                "Taille (octets)": t["size"],
-                "Φc": t["phi_c"],
-                "Date": t["timestamp"]
-            }
-            for t in engine.transfers
-        ])
-
-# ===============================
+# =========================================================
 # FOOTER
-# ===============================
+# =========================================================
 st.divider()
 st.markdown("""
-### 🚀 TTU-Sync comme outil de partage
+### 🧠 Ce que fait réellement TTU-Sync
 
-• Partage fichiers **PC ↔ téléphone** via navigateur  
-• Sans limite stricte (dépend du serveur Streamlit)  
-• Téléchargement immédiat, sans compte  
-• Φc = contrôle de qualité du transfert  
+✔ Partage PC ↔ téléphone  
+✔ Aucun compte  
+✔ Aucun stockage permanent  
+✔ Sécurité par chiffrement AES (Fernet)  
+✔ Intégrité garantie SHA-256  
+✔ Auto-destruction contrôlée  
 
-👉 Alternative conceptuelle à WeTransfer / Smash  
-👉 Base idéale pour chiffrement, lien temporaire, QR code
+👉 **TTU-Sync = WeTransfer + Signal + QR**
 """)
